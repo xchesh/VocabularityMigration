@@ -7,5 +7,5 @@ First of all - create `service-account-key.json` with firestore service account 
 Start sync:
 
 ```
-node index.js ./path/to/file.json
+node index.js ./path/to/file.json [collection name]
 ```
