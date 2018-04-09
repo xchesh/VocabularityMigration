@@ -1,18 +1,20 @@
 const fs = require("fs");
-const admin = require("firebase-admin");
+const stitch = require("mongodb-stitch");
+const { serviceAccount } = require("./service-account-key.js");
 
 const logger = require("./logger");
-const serviceAccount = require("./service-account-key.json");
 
 const filePath = process.argv[2];
-const collection = process.argv[3] || "words.basic";
+const collection = process.argv[3] || "basic";
+const db = process.argv[4] || "words";
+const param = process.argv[5] || "name";
 
 if (!filePath || !fs.statSync(filePath)) {
   return logger.error("File not found");
 }
 
-if (!collection) {
-  logger.log("Using 'words.basic' collection");
+if (!process.argv[3]) {
+  logger.log("Using 'basic' collection");
 }
 
 const dataFileContent = JSON.parse(fs.readFileSync(filePath));
@@ -23,119 +25,99 @@ if (!Array.isArray(dataFileContent)) {
 
 logger.log(`File "${filePath}" has ${dataFileContent.length} docs`);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://langlearn-ef6ef.firebaseio.com"
-});
-
-const store = admin.firestore();
+const isDataEqual = (oldData, newData) => {
+  for (let p in newData) {
+    if (newData[p] !== oldData[p]) {
+      return false;
+    }
+  }
+  return true;
+};
 
 (async () => {
+  const client = await stitch.StitchClientFactory.create("vocabularity-pqhdn");
+  const store = client.service("mongodb", "mongodb-atlas").db(db);
+
+  await client.authenticate("apiKey", serviceAccount.key).catch(logger.error);
+
   const docsForRemove = [];
   const docsForUpdate = [];
 
-  const dataSnapshot = await store.collection(collection).get();
+  const docsFromDB = await store
+    .collection(collection)
+    .find()
+    .execute();
 
-  logger.log(`Found ${dataSnapshot.size} docs in "${collection}" collection`);
+  logger.log(`Found ${docsFromDB.length} docs in "${collection}" collection`);
 
-  dataSnapshot.forEach(doc => {
-    const docData = doc.data();
+  docsFromDB.forEach(doc => {
     const docFromFileIndex = dataFileContent.findIndex(
-      i => i.name == docData.name
+      i => i[param] == doc[param]
     );
     if (~docFromFileIndex) {
-      docsForUpdate.push({
-        id: doc.id,
-        data: dataFileContent[docFromFileIndex]
-      });
+      if (!isDataEqual(doc, dataFileContent[docFromFileIndex])) {
+        docsForUpdate.push({
+          _id: doc._id,
+          data: dataFileContent[docFromFileIndex]
+        });
+      }
       dataFileContent.splice(docFromFileIndex, 1);
     } else {
-      docsForRemove.push(doc.id);
+      docsForRemove.push(doc._id);
     }
   });
 
-  dataBatchUpdate({
-    dataForUpdate: docsForUpdate,
-    dataForRemove: docsForRemove,
-    dataForCreate: dataFileContent
-  });
+  return dataBatchUpdate(
+    {
+      dataForUpdate: docsForUpdate,
+      dataForRemove: docsForRemove,
+      dataForCreate: dataFileContent
+    },
+    store
+  );
 })();
-
-const actionTypes = {
-  CREATE: "set",
-  UPDATE: "update",
-  DELETE: "delete"
-};
 
 async function dataBatchUpdate(
   { dataForUpdate, dataForRemove, dataForCreate },
+  store,
   collectionName = collection
 ) {
-  const actions = [];
+  logger.log("Sync started");
+
+  const currentCollection = store.collection(collection);
 
   logger.warn(`| ${dataForCreate.length} docs will be created`);
-  dataForCreate.forEach(data => {
-    actions.push({ type: actionTypes.CREATE, data });
-  });
-
-  logger.warn(`| ${dataForUpdate.length} docs will be updated`);
-  dataForUpdate.forEach(data => {
-    actions.push({ type: actionTypes.UPDATE, data });
-  });
-
   logger.warn(`| ${dataForRemove.length} docs will be deleted`);
-  dataForRemove.forEach(docId => {
-    actions.push({ type: actionTypes.DELETE, data: docId });
-  });
+  logger.warn(`| ${dataForUpdate.length} docs will be updated`);
 
-  logger.log("Group sync started");
-  let index = 1;
-  while (actions.length) {
-    await batchUpdate(actions.splice(0, 500), index);
-    index++;
-  }
-  logger.log("Group sync finished");
-}
-
-async function batchUpdate(data, group, collectionName = collection) {
-  if (data.length > 500) {
-    return logger.error("Cannot write more than 500 entities in a single call");
+  if (dataForCreate.length > 0) {
+    logger.log("Inserting has been started");
+    await currentCollection.insertMany(dataForCreate);
+    logger.log("Inserting has finished");
   }
 
-  logger.success(`| Group ${group} sync started: ${data.length} items`);
-
-  const batch = store.batch();
-
-  data.forEach(action => {
-    callBatchAction(action.type, action.data, batch);
-  });
-
-  return batch
-    .commit()
-    .then(() => {
-      logger.success(`| Group ${group} sync finished`);
-    })
-    .catch(e => {
-      logger.error("\x1b[31m", `| Group ${group} sync failed`);
-      logger.error(e);
-    });
-}
-
-function callBatchAction(type, docData, batch, collectionName = collection) {
-  switch (type) {
-    case actionTypes.CREATE:
-      return batch[actionTypes.CREATE](
-        store.collection(collectionName).doc(),
-        docData
-      );
-    case actionTypes.UPDATE:
-      return batch[actionTypes.UPDATE](
-        store.collection(collectionName).doc(docData.id),
-        docData.data
-      );
-    case actionTypes.DELETE:
-      return batch[actionTypes.DELETE](
-        store.collection(collectionName).doc(docData)
-      );
+  if (dataForRemove.length > 0) {
+    logger.log("Removing has been started");
+    await currentCollection.deleteMany({ _id: { $in: dataForRemove } });
+    logger.log("Removing has finished");
   }
+
+  if (dataForUpdate.length > 0) {
+    logger.log("Updating has been started");
+    for (let indx = 0; indx < dataForUpdate.length; indx++) {
+      await currentCollection.updateOne(
+        { _id: dataForUpdate[indx]._id },
+        { $set: dataForUpdate[indx].data }
+      );
+    }
+    logger.log("Updating has finished");
+  }
+
+  if (dataForCreate.length + dataForRemove.length + dataForUpdate.length < 1) {
+    logger.log("------------------------");
+    logger.log("   Already up to date");
+    logger.log("------------------------");
+  }
+
+  logger.log("Sync successful finished");
 }
